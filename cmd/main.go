@@ -42,9 +42,9 @@ type Pubspec struct {
 }
 
 type Stats struct {
-	Dependencies        map[string]map[string]interface{} `json:"dependencies"`
-	DevDependencies     map[string]map[string]interface{} `json:"dev_dependencies"`
-	DependencyOverrides map[string]map[string]interface{} `json:"dependency_overrides"`
+	Dependencies        []map[string]interface{} `json:"dependencies"`
+	DevDependencies     []map[string]interface{} `json:"dev_dependencies"`
+	DependencyOverrides []map[string]interface{} `json:"dependency_overrides"`
 }
 
 // --- Core logic ---
@@ -121,6 +121,7 @@ func main() {
 	outPath := flag.String("out", "", "Path to output JSON file")
 	minUsage := flag.Int("min", 1, "Minimum usage count for package to be included in statistics")
 	helpFlag := flag.Bool("help", false, "Show usage help")
+	mainDeps := flag.Bool("maindeps", false, "Only count main dependencies")
 	flag.Parse()
 
 	if *helpFlag {
@@ -128,11 +129,12 @@ func main() {
   pgs --env .env --repos repos.txt --out stats.json [--min N]
 
 Options:
-  --env     Path to .env file containing GITHUB_TOKEN
-  --repos   Path to file with GitHub repositories (format: owner/repo per line)
-  --out     Path to output JSON file
-  --min     Minimum number of package usages to include in stats (default: 1)
-  --help    Show this help message`)
+  --env      Path to .env file containing GITHUB_TOKEN
+  --repos    Path to file with GitHub repositories (format: owner/repo per line)
+  --out      Path to output JSON file
+  --min      Minimum number of package usages to include in stats (default: 1)
+  --maindeps Only count main dependencies
+  --help     Show this help message`)
 		return
 	}
 
@@ -209,11 +211,13 @@ Options:
 			for k := range ps.Dependencies {
 				stats.deps[k]++
 			}
-			for k := range ps.DevDependencies {
-				stats.devDeps[k]++
-			}
-			for k := range ps.DependencyOverrides {
-				stats.overrides[k]++
+			if !*mainDeps {
+				for k := range ps.DevDependencies {
+					stats.devDeps[k]++
+				}
+				for k := range ps.DependencyOverrides {
+					stats.overrides[k]++
+				}
 			}
 			mu.Unlock()
 		}(i, full)
@@ -221,36 +225,35 @@ Options:
 
 	wg.Wait()
 
-	// Filter by min usage
-	finalStats := Stats{
-		Dependencies:        map[string]map[string]interface{}{},
-		DevDependencies:     map[string]map[string]interface{}{},
-		DependencyOverrides: map[string]map[string]interface{}{},
+	buildSortedList := func(m map[string]int) []map[string]interface{} {
+		type entry struct {
+			Name  string
+			Count int
+		}
+		var list []entry
+		for k, v := range m {
+			if v >= *minUsage {
+				list = append(list, entry{Name: k, Count: v})
+			}
+		}
+		sort.Slice(list, func(i, j int) bool {
+			return list[i].Count < list[j].Count
+		})
+		var result []map[string]interface{}
+		for _, e := range list {
+			result = append(result, map[string]interface{}{
+				"name":  e.Name,
+				"count": e.Count,
+				"url":   fmt.Sprintf("https://pub.dev/packages/%s", e.Name),
+			})
+		}
+		return result
 	}
 
-	for pkg, count := range stats.deps {
-		if count >= *minUsage {
-			finalStats.Dependencies[pkg] = map[string]interface{}{
-				"count": count,
-				"url":   fmt.Sprintf("https://pub.dev/packages/%s", pkg),
-			}
-		}
-	}
-	for pkg, count := range stats.devDeps {
-		if count >= *minUsage {
-			finalStats.DevDependencies[pkg] = map[string]interface{}{
-				"count": count,
-				"url":   fmt.Sprintf("https://pub.dev/packages/%s", pkg),
-			}
-		}
-	}
-	for pkg, count := range stats.overrides {
-		if count >= *minUsage {
-			finalStats.DependencyOverrides[pkg] = map[string]interface{}{
-				"count": count,
-				"url":   fmt.Sprintf("https://pub.dev/packages/%s", pkg),
-			}
-		}
+	finalStats := Stats{
+		Dependencies:        buildSortedList(stats.deps),
+		DevDependencies:     buildSortedList(stats.devDeps),
+		DependencyOverrides: buildSortedList(stats.overrides),
 	}
 
 	data, _ := json.MarshalIndent(finalStats, "", "  ")
