@@ -22,6 +22,11 @@ type Pubspec struct {
 	DevDependencies map[string]interface{} `yaml:"dev_dependencies"`
 }
 
+type PackageStat struct {
+	Count int    `json:"count"`
+	URL   string `json:"url"`
+}
+
 func main() {
 	reposFile := flag.String("repos", "", "Path to file with list of repositories (<owner>/<repo> per line)")
 	outFile := flag.String("out", "", "Path to JSON output file")
@@ -66,7 +71,7 @@ func main() {
 		log.Fatalf("Failed to write output: %v", err)
 	}
 
-	fmt.Printf("✅ Stats written to %s (%d libraries)\n", *outFile, len(allDeps))
+	fmt.Printf("✅ Stats written to %s (%d packages)\n", *outFile, len(allDeps))
 }
 
 func printHelp() {
@@ -80,10 +85,7 @@ Usage:
   --help           Show this help message
 
 Example:
-  go run . --env .env --repos repos.txt --out stats.json --limit 3
-
-Env file example:
-  GITHUB_TOKEN=ghp_ABC123xyz`)
+  go run . --env .env --repos repos.txt --out stats.json --limit 3`)
 }
 
 func readEnvToken(path string) (string, error) {
@@ -119,9 +121,9 @@ func readRepos(path string) ([]string, error) {
 	return repos, nil
 }
 
-func collectDependencies(ctx context.Context, client *github.Client, repos []string, limit int) map[string]int {
+func collectDependencies(ctx context.Context, client *github.Client, repos []string, limit int) map[string]PackageStat {
 	var mu sync.Mutex
-	allDeps := make(map[string]int)
+	allDeps := make(map[string]PackageStat)
 	wg := sync.WaitGroup{}
 	sem := make(chan struct{}, limit)
 
@@ -158,11 +160,14 @@ func collectDependencies(ctx context.Context, client *github.Client, repos []str
 
 			mu.Lock()
 			for _, d := range deps {
-				allDeps[d]++
+				p := allDeps[d]
+				p.Count++
+				p.URL = fmt.Sprintf("https://pub.dev/packages/%s", d)
+				allDeps[d] = p
 			}
 			mu.Unlock()
 
-			time.Sleep(200 * time.Millisecond) // to avoid hitting rate limits
+			time.Sleep(200 * time.Millisecond)
 		}(repoFull)
 	}
 
@@ -194,7 +199,7 @@ func splitRepo(full string) (owner, repo string, ok bool) {
 	return parts[0], parts[1], true
 }
 
-func writeJSON(path string, m map[string]int) error {
+func writeJSON(path string, m map[string]PackageStat) error {
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
