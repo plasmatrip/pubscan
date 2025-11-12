@@ -125,17 +125,19 @@ func main() {
 	envPath := flag.String("env", "", "Path to .env file containing GITHUB_TOKEN")
 	reposPath := flag.String("repos", "", "Path to file with list of GitHub repositories")
 	outPath := flag.String("out", "", "Path to output JSON file")
+	minUsage := flag.Int("min", 1, "Minimum usage count for package to be included in statistics")
 	helpFlag := flag.Bool("help", false, "Show usage help")
 	flag.Parse()
 
 	if *helpFlag {
 		fmt.Println(`Usage:
-  pgs --env .env --repos repos.txt --out stats.json
+  pgs --env .env --repos repos.txt --out stats.json [--min N]
 
 Options:
   --env     Path to .env file containing GITHUB_TOKEN
   --repos   Path to file with GitHub repositories (format: owner/repo per line)
   --out     Path to output JSON file
+  --min     Minimum number of package usages to include in stats (default: 1)
   --help    Show this help message`)
 		return
 	}
@@ -169,16 +171,17 @@ Options:
 	mu := sync.Mutex{}
 	stats := map[string]int{}
 
-	sem := make(chan struct{}, 5) // limit to 5 concurrent requests
+	sem := make(chan struct{}, 5) // limit concurrency
 
 	var wg sync.WaitGroup
-	for _, full := range repos {
+	for i, full := range repos {
 		wg.Add(1)
-		go func(full string) {
+		go func(i int, full string) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
+			fmt.Printf("[%d/%d] Processing %s...\n", i+1, len(repos), full)
 			parts := strings.Split(full, "/")
 			if len(parts) != 2 {
 				fmt.Printf("Invalid repo format: %s\n", full)
@@ -204,25 +207,28 @@ Options:
 				stats[k] += v
 			}
 			mu.Unlock()
-		}(full)
+		}(i, full)
 	}
 
 	wg.Wait()
 
-	// add pub.dev links
-	output := map[string]map[string]interface{}{}
+	// filter by min usage
+	filtered := map[string]map[string]interface{}{}
 	for pkg, count := range stats {
-		output[pkg] = map[string]interface{}{
-			"count": count,
-			"url":   fmt.Sprintf("https://pub.dev/packages/%s", pkg),
+		if count >= *minUsage {
+			filtered[pkg] = map[string]interface{}{
+				"count": count,
+				"url":   fmt.Sprintf("https://pub.dev/packages/%s", pkg),
+			}
 		}
 	}
 
-	data, _ := json.MarshalIndent(output, "", "  ")
+	data, _ := json.MarshalIndent(filtered, "", "  ")
 	if err := os.WriteFile(*outPath, data, 0644); err != nil {
 		fmt.Printf("Failed to write JSON: %v\n", err)
 		return
 	}
 
-	fmt.Printf("✅ Stats collected successfully and saved to %s\n", *outPath)
+	fmt.Printf("✅ Stats collected successfully (%d packages, min usage %d)\n", len(filtered), *minUsage)
+	fmt.Printf("Saved to %s\n", *outPath)
 }
