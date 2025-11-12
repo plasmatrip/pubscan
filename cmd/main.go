@@ -41,6 +41,12 @@ type Pubspec struct {
 	DependencyOverrides map[string]interface{} `yaml:"dependency_overrides"`
 }
 
+type Stats struct {
+	Dependencies        map[string]map[string]interface{} `json:"dependencies"`
+	DevDependencies     map[string]map[string]interface{} `json:"dev_dependencies"`
+	DependencyOverrides map[string]map[string]interface{} `json:"dependency_overrides"`
+}
+
 // --- Core logic ---
 
 func getLatestBranch(ctx context.Context, client *http.Client, owner, repo, token string) (string, error) {
@@ -101,22 +107,10 @@ func getPubspec(ctx context.Context, client *http.Client, owner, repo, branch, t
 	return string(data), nil
 }
 
-func parsePubspec(content string) map[string]int {
+func parsePubspec(content string) Pubspec {
 	var ps Pubspec
-	deps := map[string]int{}
-	if err := yaml.Unmarshal([]byte(content), &ps); err != nil {
-		return deps
-	}
-	for k := range ps.Dependencies {
-		deps[k]++
-	}
-	for k := range ps.DevDependencies {
-		deps[k]++
-	}
-	for k := range ps.DependencyOverrides {
-		deps[k]++
-	}
-	return deps
+	_ = yaml.Unmarshal([]byte(content), &ps)
+	return ps
 }
 
 // --- Main logic ---
@@ -169,10 +163,19 @@ Options:
 	client := &http.Client{Timeout: 10 * time.Second}
 	ctx := context.Background()
 	mu := sync.Mutex{}
-	stats := map[string]int{}
 
-	sem := make(chan struct{}, 5) // limit concurrency
+	type counter struct {
+		deps      map[string]int
+		devDeps   map[string]int
+		overrides map[string]int
+	}
+	stats := counter{
+		deps:      map[string]int{},
+		devDeps:   map[string]int{},
+		overrides: map[string]int{},
+	}
 
+	sem := make(chan struct{}, 5)
 	var wg sync.WaitGroup
 	for i, full := range repos {
 		wg.Add(1)
@@ -201,10 +204,16 @@ Options:
 				return
 			}
 
-			deps := parsePubspec(content)
+			ps := parsePubspec(content)
 			mu.Lock()
-			for k, v := range deps {
-				stats[k] += v
+			for k := range ps.Dependencies {
+				stats.deps[k]++
+			}
+			for k := range ps.DevDependencies {
+				stats.devDeps[k]++
+			}
+			for k := range ps.DependencyOverrides {
+				stats.overrides[k]++
 			}
 			mu.Unlock()
 		}(i, full)
@@ -212,23 +221,44 @@ Options:
 
 	wg.Wait()
 
-	// filter by min usage
-	filtered := map[string]map[string]interface{}{}
-	for pkg, count := range stats {
+	// Filter by min usage
+	finalStats := Stats{
+		Dependencies:        map[string]map[string]interface{}{},
+		DevDependencies:     map[string]map[string]interface{}{},
+		DependencyOverrides: map[string]map[string]interface{}{},
+	}
+
+	for pkg, count := range stats.deps {
 		if count >= *minUsage {
-			filtered[pkg] = map[string]interface{}{
+			finalStats.Dependencies[pkg] = map[string]interface{}{
+				"count": count,
+				"url":   fmt.Sprintf("https://pub.dev/packages/%s", pkg),
+			}
+		}
+	}
+	for pkg, count := range stats.devDeps {
+		if count >= *minUsage {
+			finalStats.DevDependencies[pkg] = map[string]interface{}{
+				"count": count,
+				"url":   fmt.Sprintf("https://pub.dev/packages/%s", pkg),
+			}
+		}
+	}
+	for pkg, count := range stats.overrides {
+		if count >= *minUsage {
+			finalStats.DependencyOverrides[pkg] = map[string]interface{}{
 				"count": count,
 				"url":   fmt.Sprintf("https://pub.dev/packages/%s", pkg),
 			}
 		}
 	}
 
-	data, _ := json.MarshalIndent(filtered, "", "  ")
+	data, _ := json.MarshalIndent(finalStats, "", "  ")
 	if err := os.WriteFile(*outPath, data, 0644); err != nil {
 		fmt.Printf("Failed to write JSON: %v\n", err)
 		return
 	}
 
-	fmt.Printf("✅ Stats collected successfully (%d packages, min usage %d)\n", len(filtered), *minUsage)
+	fmt.Printf("✅ Stats collected successfully (min usage %d)\n", *minUsage)
 	fmt.Printf("Saved to %s\n", *outPath)
 }
