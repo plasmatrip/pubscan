@@ -1,208 +1,228 @@
 package main
 
 import (
-	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
+	"io"
+	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/go-github/v66/github"
-	"golang.org/x/oauth2"
+	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v3"
 )
 
+// --- Structures ---
+
+type Branch struct {
+	Name   string `json:"name"`
+	Commit struct {
+		Commit struct {
+			Author struct {
+				Date time.Time `json:"date"`
+			} `json:"author"`
+		} `json:"commit"`
+	} `json:"commit"`
+}
+
+type FileContent struct {
+	Content string `json:"content"`
+}
+
 type Pubspec struct {
-	Dependencies    map[string]interface{} `yaml:"dependencies"`
-	DevDependencies map[string]interface{} `yaml:"dev_dependencies"`
+	Dependencies        map[string]interface{} `yaml:"dependencies"`
+	DevDependencies     map[string]interface{} `yaml:"dev_dependencies"`
+	DependencyOverrides map[string]interface{} `yaml:"dependency_overrides"`
 }
 
-type PackageStat struct {
-	Count int    `json:"count"`
-	URL   string `json:"url"`
-}
+// --- Core logic ---
 
-func main() {
-	reposFile := flag.String("repos", "", "Path to file with list of repositories (<owner>/<repo> per line)")
-	outFile := flag.String("out", "", "Path to JSON output file")
-	envFile := flag.String("env", "", "Path to .env file with GITHUB_TOKEN")
-	limit := flag.Int("limit", 5, "Maximum number of parallel requests (default: 5)")
-	help := flag.Bool("help", false, "Show usage help")
+func getLatestBranch(ctx context.Context, client *http.Client, owner, repo, token string) (string, error) {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/branches", owner, repo)
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req.Header.Set("Authorization", "token "+token)
 
-	flag.Parse()
-
-	if *help {
-		printHelp()
-		return
-	}
-
-	if *reposFile == "" || *outFile == "" || *envFile == "" {
-		fmt.Println("Usage: go run . --env <path> --repos <path> --out <path> [--limit N]")
-		fmt.Println("Run with --help to see all options.")
-		os.Exit(1)
-	}
-
-	token, err := readEnvToken(*envFile)
-	if err != nil {
-		log.Fatalf("Failed to read GITHUB_TOKEN: %v", err)
-	}
-	if token == "" {
-		log.Fatal("GITHUB_TOKEN not found in env file")
-	}
-
-	repos, err := readRepos(*reposFile)
-	if err != nil {
-		log.Fatalf("Failed to read repos file: %v", err)
-	}
-
-	ctx := context.Background()
-	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
-	tc := oauth2.NewClient(ctx, ts)
-	client := github.NewClient(tc)
-
-	allDeps := collectDependencies(ctx, client, repos, *limit)
-
-	if err := writeJSON(*outFile, allDeps); err != nil {
-		log.Fatalf("Failed to write output: %v", err)
-	}
-
-	fmt.Printf("✅ Stats written to %s (%d packages)\n", *outFile, len(allDeps))
-}
-
-func printHelp() {
-	fmt.Println(`GitHub pubspec.yaml stats collector
-
-Usage:
-  --env <path>     Path to .env file containing GITHUB_TOKEN
-  --repos <path>   Path to a file with GitHub repositories (one per line)
-  --out <path>     Path to JSON file to write the result
-  --limit <n>      Limit of concurrent requests (default: 5)
-  --help           Show this help message
-
-Example:
-  go run . --env .env --repos repos.txt --out stats.json --limit 3`)
-}
-
-func readEnvToken(path string) (string, error) {
-	file, err := os.Open(path)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer resp.Body.Close()
 
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "GITHUB_TOKEN=") {
-			return strings.TrimPrefix(line, "GITHUB_TOKEN="), nil
-		}
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("failed to get branches: %s (%s)", resp.Status, string(body))
 	}
-	return "", scanner.Err()
+
+	var branches []Branch
+	if err := json.NewDecoder(resp.Body).Decode(&branches); err != nil {
+		return "", err
+	}
+	if len(branches) == 0 {
+		return "", fmt.Errorf("no branches found")
+	}
+
+	sort.Slice(branches, func(i, j int) bool {
+		return branches[i].Commit.Commit.Author.Date.After(branches[j].Commit.Commit.Author.Date)
+	})
+
+	return branches[0].Name, nil
 }
 
-func readRepos(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
+func getPubspec(ctx context.Context, client *http.Client, owner, repo, branch, token string) (string, error) {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/pubspec.yaml?ref=%s", owner, repo, branch)
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req.Header.Set("Authorization", "token "+token)
+
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	lines := strings.Split(string(data), "\n")
-	var repos []string
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			repos = append(repos, line)
-		}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("failed to fetch pubspec.yaml from %s/%s (%s)", owner, repo, resp.Status)
 	}
-	return repos, nil
+
+	var file FileContent
+	if err := json.NewDecoder(resp.Body).Decode(&file); err != nil {
+		return "", err
+	}
+
+	data, err := base64.StdEncoding.DecodeString(file.Content)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
-func collectDependencies(ctx context.Context, client *github.Client, repos []string, limit int) map[string]PackageStat {
-	var mu sync.Mutex
-	allDeps := make(map[string]PackageStat)
-	wg := sync.WaitGroup{}
-	sem := make(chan struct{}, limit)
+func parsePubspec(content string) map[string]int {
+	var ps Pubspec
+	deps := map[string]int{}
+	if err := yaml.Unmarshal([]byte(content), &ps); err != nil {
+		return deps
+	}
+	for k := range ps.Dependencies {
+		deps[k]++
+	}
+	for k := range ps.DevDependencies {
+		deps[k]++
+	}
+	for k := range ps.DependencyOverrides {
+		deps[k]++
+	}
+	return deps
+}
 
-	for _, repoFull := range repos {
+// --- Main logic ---
+
+func main() {
+	envPath := flag.String("env", "", "Path to .env file containing GITHUB_TOKEN")
+	reposPath := flag.String("repos", "", "Path to file with list of GitHub repositories")
+	outPath := flag.String("out", "", "Path to output JSON file")
+	helpFlag := flag.Bool("help", false, "Show usage help")
+	flag.Parse()
+
+	if *helpFlag {
+		fmt.Println(`Usage:
+  pgs --env .env --repos repos.txt --out stats.json
+
+Options:
+  --env     Path to .env file containing GITHUB_TOKEN
+  --repos   Path to file with GitHub repositories (format: owner/repo per line)
+  --out     Path to output JSON file
+  --help    Show this help message`)
+		return
+	}
+
+	if *envPath == "" || *reposPath == "" || *outPath == "" {
+		fmt.Println("Missing required arguments. Use --help for usage.")
+		return
+	}
+
+	_ = godotenv.Load(*envPath)
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		fmt.Println("GITHUB_TOKEN not found in .env file")
+		return
+	}
+
+	file, err := os.ReadFile(*reposPath)
+	if err != nil {
+		fmt.Printf("Failed to read repos file: %v\n", err)
+		return
+	}
+
+	repos := strings.Fields(strings.TrimSpace(string(file)))
+	if len(repos) == 0 {
+		fmt.Println("No repositories found in the file.")
+		return
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	ctx := context.Background()
+	mu := sync.Mutex{}
+	stats := map[string]int{}
+
+	sem := make(chan struct{}, 5) // limit to 5 concurrent requests
+
+	var wg sync.WaitGroup
+	for _, full := range repos {
 		wg.Add(1)
-		go func(r string) {
+		go func(full string) {
 			defer wg.Done()
-			sem <- struct{}{} // acquire slot
+			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			owner, repo, ok := splitRepo(r)
-			if !ok {
-				log.Printf("invalid repo format: %s", r)
+			parts := strings.Split(full, "/")
+			if len(parts) != 2 {
+				fmt.Printf("Invalid repo format: %s\n", full)
 				return
 			}
+			owner, repo := parts[0], parts[1]
 
-			content, _, _, err := client.Repositories.GetContents(ctx, owner, repo, "pubspec.yaml", nil)
+			branch, err := getLatestBranch(ctx, client, owner, repo, token)
 			if err != nil {
-				log.Printf("[%s] failed to fetch pubspec.yaml: %v", r, err)
+				fmt.Printf("Error getting branch for %s: %v\n", full, err)
 				return
 			}
 
-			data, err := content.GetContent()
+			content, err := getPubspec(ctx, client, owner, repo, branch, token)
 			if err != nil {
-				log.Printf("[%s] failed to read pubspec.yaml: %v", r, err)
+				fmt.Printf("Error fetching pubspec.yaml for %s: %v\n", full, err)
 				return
 			}
 
-			deps, err := extractDependencies([]byte(data))
-			if err != nil {
-				log.Printf("[%s] failed to parse yaml: %v", r, err)
-				return
-			}
-
+			deps := parsePubspec(content)
 			mu.Lock()
-			for _, d := range deps {
-				p := allDeps[d]
-				p.Count++
-				p.URL = fmt.Sprintf("https://pub.dev/packages/%s", d)
-				allDeps[d] = p
+			for k, v := range deps {
+				stats[k] += v
 			}
 			mu.Unlock()
-
-			time.Sleep(200 * time.Millisecond)
-		}(repoFull)
+		}(full)
 	}
 
 	wg.Wait()
-	return allDeps
-}
 
-func extractDependencies(data []byte) ([]string, error) {
-	var p Pubspec
-	if err := yaml.Unmarshal(data, &p); err != nil {
-		return nil, err
+	// add pub.dev links
+	output := map[string]map[string]interface{}{}
+	for pkg, count := range stats {
+		output[pkg] = map[string]interface{}{
+			"count": count,
+			"url":   fmt.Sprintf("https://pub.dev/packages/%s", pkg),
+		}
 	}
 
-	var deps []string
-	for k := range p.Dependencies {
-		deps = append(deps, k)
+	data, _ := json.MarshalIndent(output, "", "  ")
+	if err := os.WriteFile(*outPath, data, 0644); err != nil {
+		fmt.Printf("Failed to write JSON: %v\n", err)
+		return
 	}
-	for k := range p.DevDependencies {
-		deps = append(deps, k)
-	}
-	return deps, nil
-}
 
-func splitRepo(full string) (owner, repo string, ok bool) {
-	parts := strings.Split(full, "/")
-	if len(parts) != 2 {
-		return "", "", false
-	}
-	return parts[0], parts[1], true
-}
-
-func writeJSON(path string, m map[string]PackageStat) error {
-	data, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0644)
+	fmt.Printf("✅ Stats collected successfully and saved to %s\n", *outPath)
 }
